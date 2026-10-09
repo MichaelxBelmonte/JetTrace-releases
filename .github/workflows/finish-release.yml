@@ -1,0 +1,58 @@
+name: Publish prepared release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version of the prepared signed draft
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Transfer verified Windows packages and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+          WINDOWS_ARTIFACT_URL: ${{ secrets.WINDOWS_ARTIFACT_URL }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os,re,subprocess,json,urllib.request,hashlib,zipfile,pathlib
+          version=os.environ['VERSION'];repo=os.environ['REPOSITORY']
+          if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+',version): raise SystemExit('Invalid version')
+          def gh(*args): return subprocess.check_output(['gh',*args],text=True)
+          release=json.loads(gh('api',f'repos/{repo}/releases/tags/v{version}'))
+          if not release['draft']: raise SystemExit('Published versions are immutable')
+          root=pathlib.Path('packages');root.mkdir()
+          gh('release','download',f'v{version}','--repo',repo,'--pattern','SHA256SUMS.txt','--dir',str(root))
+          checks={name:digest for digest,name in (line.split('  ',1) for line in (root/'SHA256SUMS.txt').read_text().splitlines())}
+          expected={'JetTrace-Mac.zip','JetTrace-Setup.exe','JetTrace-Windows-x64.zip',f'JetTrace-{version}-full.nupkg','appcast.xml','windows-updates.json'}
+          if set(checks)!=expected: raise SystemExit('Unexpected release asset list')
+          url=os.environ['WINDOWS_ARTIFACT_URL']
+          if not url.startswith('https://') or '.blob.core.windows.net/' not in url: raise SystemExit('Unexpected artifact host')
+          urllib.request.urlretrieve(url,'windows-artifact.zip')
+          files=['JetTrace-Setup.exe','JetTrace-Windows-x64.zip',f'releases/JetTrace-{version}-full.nupkg']
+          with zipfile.ZipFile('windows-artifact.zip') as archive:
+            for source in files:
+              name=source.rsplit('/',1)[-1];target=root/name;digest=hashlib.sha256()
+              with archive.open(source) as inp,target.open('wb') as out:
+                for chunk in iter(lambda:inp.read(1048576),b''):digest.update(chunk);out.write(chunk)
+              if digest.hexdigest()!=checks[name]: raise SystemExit('Checksum mismatch: '+name)
+              existing=next((a for a in release['assets'] if a['name']==name),None)
+              if existing:
+                if existing.get('digest')!='sha256:'+checks[name] or existing['state']!='uploaded': raise SystemExit('Conflicting asset: '+name)
+              else: gh('release','upload',f'v{version}','--repo',repo,str(target))
+          release=json.loads(gh('api',f'repos/{repo}/releases/{release["id"]}'))
+          assets={a['name']:a for a in release['assets']}
+          checks['SHA256SUMS.txt']=hashlib.sha256((root/'SHA256SUMS.txt').read_bytes()).hexdigest()
+          if set(assets)!=set(checks): raise SystemExit('Missing or unexpected release assets')
+          for name,digest in checks.items():
+            if assets[name].get('digest')!='sha256:'+digest or assets[name]['state']!='uploaded': raise SystemExit('Remote integrity check failed: '+name)
+          gh('release','edit',f'v{version}','--repo',repo,'--draft=false','--latest')
+          print('Published JetTrace '+version+': all seven assets verified')
+          PY
