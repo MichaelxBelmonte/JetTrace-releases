@@ -1,0 +1,62 @@
+name: Publish verified private build packages
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Prepared version with successful signed build
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Transfer signed packages and verify every checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+          PRIVATE_BUILD_ASSETS: ${{ secrets.PRIVATE_BUILD_ASSETS }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess, urllib.request
+          version = os.environ['VERSION']; repo = os.environ['REPOSITORY']
+          if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version): raise SystemExit('Invalid version')
+          def gh(*args): return subprocess.check_output(['gh', *args], text=True)
+          release = next(r for r in json.loads(gh('api', f'repos/{repo}/releases')) if r['tag_name'] == 'v' + version)
+          if not release['draft']: raise SystemExit('Published packages are immutable')
+          expected = {'JetTrace-Mac.zip', 'JetTrace-Setup.exe', 'JetTrace-Windows-x64.zip', f'JetTrace-{version}-full.nupkg', 'appcast.xml', 'windows-updates.json', 'SHA256SUMS.txt'}
+          sources = json.loads(os.environ['PRIVATE_BUILD_ASSETS'])
+          if set(sources) != expected: raise SystemExit('Unexpected source packages')
+          root = pathlib.Path('packages'); root.mkdir()
+          for name, source in sources.items():
+              url = source['url']
+              if not url.startswith('https://release-assets.githubusercontent.com/'): raise SystemExit('Unexpected source host')
+              digest = hashlib.sha256(); size = 0
+              with urllib.request.urlopen(url, timeout=120) as response, (root / name).open('wb') as output:
+                  for block in iter(lambda: response.read(1048576), b''):
+                      size += len(block)
+                      if size > source['size'] or size > 1000000000: raise SystemExit('Unexpected package size')
+                      digest.update(block); output.write(block)
+              if size != source['size'] or digest.hexdigest() != source['sha256']: raise SystemExit('Source integrity check failed: ' + name)
+          checks = dict((name, digest) for digest, name in (line.split('  ', 1) for line in (root / 'SHA256SUMS.txt').read_text().splitlines()))
+          if set(checks) != expected - {'SHA256SUMS.txt'}: raise SystemExit('Unexpected checksum manifest')
+          for name, digest in checks.items():
+              if digest != sources[name]['sha256']: raise SystemExit('Manifest mismatch: ' + name)
+          for name in sorted(expected):
+              existing = next((a for a in release['assets'] if a['name'] == name), None)
+              if existing:
+                  if existing['digest'] != 'sha256:' + sources[name]['sha256']: raise SystemExit('Conflicting package: ' + name)
+              else:
+                  gh('release', 'upload', 'v' + version, str(root / name), '--repo', repo)
+          release = json.loads(gh('api', f'repos/{repo}/releases/{release["id"]}'))
+          assets = {a['name']: a for a in release['assets']}
+          if set(assets) != expected: raise SystemExit('Unexpected uploaded package list')
+          for name, source in sources.items():
+              if assets[name]['state'] != 'uploaded' or assets[name]['digest'] != 'sha256:' + source['sha256']:
+                  raise SystemExit('Remote verification failed: ' + name)
+          gh('api', '-X', 'PATCH', f'repos/{repo}/releases/{release["id"]}', '-F', 'draft=false', '-f', 'make_latest=' + ('false' if release.get('prerelease') else 'true'))
+          print('PASS: published verified JetTrace ' + version + '; signed packages copied unchanged.')
+          PY
