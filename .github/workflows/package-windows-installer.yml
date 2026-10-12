@@ -1,0 +1,95 @@
+name: Package Windows installer for sharing
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing published version to package (no rebuild)
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Verify installer and add a shareable ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess, urllib.request, zipfile
+          version = os.environ['VERSION']; repo = os.environ['REPOSITORY']
+          if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version): raise SystemExit('Invalid version')
+          def gh(*args): return subprocess.check_output(['gh', *args], text=True)
+          release = json.loads(gh('api', f'repos/{repo}/releases/tags/v{version}'))
+          if release['draft']: raise SystemExit('Select an already published release')
+          assets = {a['name']: a for a in release['assets']}
+          root = pathlib.Path('packages'); root.mkdir()
+          setup = root / 'JetTrace-Setup.exe'
+          urllib.request.urlretrieve(assets[setup.name]['browser_download_url'], setup)
+          with urllib.request.urlopen(assets['SHA256SUMS.txt']['browser_download_url'], timeout=120) as response:
+              checks = dict((name, digest) for digest, name in (line.split('  ', 1) for line in response.read().decode().splitlines()))
+          digest = hashlib.sha256(setup.read_bytes()).hexdigest()
+          if digest != checks[setup.name] or assets[setup.name]['digest'] != 'sha256:' + digest:
+              raise SystemExit('Installer integrity mismatch')
+          if setup.stat().st_size != assets[setup.name]['size']: raise SystemExit('Incomplete installer')
+          readme = f'''JETTRACE {version} - INSTALLAZIONE WINDOWS
+          
+          1. Estrai tutto il contenuto di questo ZIP.
+          2. Chiudi JetTrace, se e gia aperto.
+          3. Esegui JetTrace-Setup.exe e completa l'installazione.
+          
+          AGGIORNAMENTI
+          Questa e la versione installabile, con aggiornamenti integrati.
+          In JetTrace: Impostazioni > Aggiornamenti > Cerca aggiornamenti.
+          Con il controllo automatico attivo, l'app avvisa quando pubblichiamo
+          una nuova versione e chiede di scaricarla e riavviare.
+          
+          COLLEGA CHROME PER INPS
+          In JetTrace: Impostazioni > Collega Chrome.
+          In Chrome: chrome://extensions > Modalita sviluppatore >
+          Carica estensione non pacchettizzata > scegli la cartella Chrome-INPS.
+          La cartella si trova in %LOCALAPPDATA%\\JetTrace\\BrowserLink\\Chrome-INPS.
+          Ricarica le pagine INPS gia aperte.
+          Quando cambia l'estensione, premi Collega Chrome e Ricarica nella scheda
+          dell'estensione in Chrome. L'app e l'estensione si aggiornano separatamente.
+          
+          REGISTRA
+          F8 due volte avvia. F8 ferma e salva automaticamente.
+          '''
+          target = root / 'JetTrace-Windows-Installazione.zip'
+          with zipfile.ZipFile(target, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
+              for name, data in [(setup.name, setup.read_bytes()), ('LEGGIMI.txt', readme.encode('utf-8'))]:
+                  info = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  info.external_attr = 0o100644 << 16
+                  archive.writestr(info, data, compresslevel=1)
+          with zipfile.ZipFile(target) as archive:
+              if archive.testzip() is not None: raise SystemExit('ZIP integrity failure')
+              if hashlib.sha256(archive.read(setup.name)).hexdigest() != digest: raise SystemExit('Bundled installer mismatch')
+          zip_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+          checksum = root / (target.name + '.sha256')
+          checksum.write_text(zip_digest + '  ' + target.name + '\n')
+          for file in [target, checksum]:
+              expected = 'sha256:' + hashlib.sha256(file.read_bytes()).hexdigest()
+              if file.name in assets:
+                  if assets[file.name]['digest'] != expected: raise SystemExit('Conflicting existing asset: ' + file.name)
+              else:
+                  gh('release', 'upload', 'v' + version, str(file), '--repo', repo)
+          release = json.loads(gh('api', f'repos/{repo}/releases/{release["id"]}'))
+          remote = next(a for a in release['assets'] if a['name'] == target.name)
+          if remote['digest'] != 'sha256:' + zip_digest: raise SystemExit('Uploaded ZIP mismatch')
+          print('PASS: ZIP contains the verified published installer; existing signed update assets unchanged.')
+          print(remote['browser_download_url'])
+          print('Size:', target.stat().st_size, 'SHA256:', zip_digest)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JetTrace-Windows-Installer-${{ inputs.version }}
+          path: |
+            packages/JetTrace-Windows-Installazione.zip
+            packages/JetTrace-Windows-Installazione.zip.sha256
+          compression-level: 0
