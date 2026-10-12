@@ -36,6 +36,7 @@ jobs:
           if digest != checks[setup.name] or assets[setup.name]['digest'] != 'sha256:' + digest:
               raise SystemExit('Installer integrity mismatch')
           if setup.stat().st_size != assets[setup.name]['size']: raise SystemExit('Incomplete installer')
+          extension_location = ('La cartella Chrome-INPS si trova sul Desktop, preparata al primo avvio.' if tuple(map(int, version.split('.'))) >= (0, 3, 5) else r'La cartella si trova in %LOCALAPPDATA%\JetTrace\BrowserLink\Chrome-INPS.')
           readme = f'''JETTRACE {version} - INSTALLAZIONE WINDOWS
           
           1. Estrai tutto il contenuto di questo ZIP.
@@ -52,7 +53,8 @@ jobs:
           In JetTrace: Impostazioni > Collega Chrome.
           In Chrome: chrome://extensions > Modalita sviluppatore >
           Carica estensione non pacchettizzata > scegli la cartella Chrome-INPS.
-          La cartella si trova in %LOCALAPPDATA%\\JetTrace\\BrowserLink\\Chrome-INPS.
+          {extension_location}
+          Lascia la cartella in questa posizione anche dopo averla collegata.
           Ricarica le pagine INPS gia aperte.
           Quando cambia l'estensione, premi Collega Chrome e Ricarica nella scheda
           dell'estensione in Chrome. L'app e l'estensione si aggiornano separatamente.
